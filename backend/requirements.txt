@@ -1,0 +1,16 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.19
+celery==5.4.0
+redis==5.2.1
+torch>=2.4.0
+torchaudio>=2.4.0
+librosa==0.10.2
+numpy>=1.26.0
+opencv-python-headless==4.10.0.84
+scipy>=1.14.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+websockets==14.1
+aiofiles==24.1.0
+soundfile>=0.12.1

@@ -1,0 +1,87 @@
+# ============================================================================
+# Haptok Backend — Docker Compose
+# ============================================================================
+# Quick start:   docker compose up --build
+# With GPU:      Uncomment the device lines below + update Dockerfile base
+# ============================================================================
+
+services:
+
+  # --------------------------------------------------------------------------
+  # FastAPI application server
+  # --------------------------------------------------------------------------
+  app:
+    build: .
+    container_name: haptok-api
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - UPLOAD_DIR=/data/uploads
+      - MODELS_DIR=/data/models
+      - MAX_VIDEO_DURATION=240
+      - MAX_FILE_SIZE=524288000
+    volumes:
+      - haptok-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # ── AMD ROCm GPU support (uncomment for GPU acceleration) ──
+    # devices:
+    #   - /dev/kfd:/dev/kfd
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - video
+    #   - render
+
+  # --------------------------------------------------------------------------
+  # Celery worker (processes videos)
+  # --------------------------------------------------------------------------
+  worker:
+    build: .
+    container_name: haptok-worker
+    command: celery -A worker.celery_app worker --loglevel=info --concurrency=2
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - UPLOAD_DIR=/data/uploads
+      - MODELS_DIR=/data/models
+      - MAX_VIDEO_DURATION=240
+    volumes:
+      - haptok-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # ── AMD ROCm GPU support (uncomment for GPU acceleration) ──
+    # devices:
+    #   - /dev/kfd:/dev/kfd
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - video
+    #   - render
+
+  # --------------------------------------------------------------------------
+  # Redis — job queue + status storage
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: haptok-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  haptok-data:
+  redis-data:
