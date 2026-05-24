@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
@@ -61,17 +62,29 @@ import com.example.haptok.theme.TextPrimary
 import com.example.haptok.theme.TextSecondary
 import com.example.haptok.theme.TextTertiary
 import com.example.haptok.ui.components.VideoCard
+import com.example.haptok.ui.components.HapticModeDialog
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
+import androidx.compose.material.icons.filled.List
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
-    onNavigateToPlayer: (String) -> Unit,
+    onNavigateToPlayer: (String, String) -> Unit,
     onNavigateToSettings: () -> Unit,
+    onNavigateToWaveforms: () -> Unit,
     modifier: Modifier = Modifier,
     viewModel: HomeViewModel = viewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val view = LocalView.current
+    val coroutineScope = rememberCoroutineScope()
+    
+    var selectedVideoUri by remember { mutableStateOf<String?>(null) }
+    var hasCachedWaveform by remember { mutableStateOf(false) }
 
     // Permission handling
     val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -106,6 +119,10 @@ fun HomeScreen(
                     view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                     onNavigateToSettings()
                 },
+                onWaveformsClick = {
+                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                    onNavigateToWaveforms()
+                }
             )
 
             // Content
@@ -150,7 +167,10 @@ fun HomeScreen(
                                     processingStatus = video.processingStatus,
                                     onClick = {
                                         view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-                                        onNavigateToPlayer(video.uri.toString())
+                                        coroutineScope.launch {
+                                            hasCachedWaveform = viewModel.hasCachedWaveform(video.uri.toString())
+                                            selectedVideoUri = video.uri.toString()
+                                        }
                                     },
                                     modifier = Modifier.aspectRatio(16f / 10f),
                                 )
@@ -181,11 +201,23 @@ fun HomeScreen(
             }
         }
     }
+
+    selectedVideoUri?.let { uri ->
+        HapticModeDialog(
+            hasCachedWaveform = hasCachedWaveform,
+            onModeSelected = { mode ->
+                selectedVideoUri = null
+                onNavigateToPlayer(uri, mode.name)
+            },
+            onDismiss = { selectedVideoUri = null }
+        )
+    }
 }
 
 @Composable
 private fun HomeTopBar(
     onSettingsClick: () -> Unit,
+    onWaveformsClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "title_gradient")
@@ -220,17 +252,30 @@ private fun HomeTopBar(
                 .testTag("app_title"),
         )
 
-        IconButton(
-            onClick = onSettingsClick,
-            modifier = Modifier
-                .align(Alignment.CenterEnd)
-                .testTag("settings_button"),
+        Row(
+            modifier = Modifier.align(Alignment.CenterEnd),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(
-                imageVector = Icons.Default.Settings,
-                contentDescription = "Settings",
-                tint = TextSecondary,
-            )
+            IconButton(
+                onClick = onWaveformsClick,
+                modifier = Modifier.testTag("waveforms_button"),
+            ) {
+                Icon(
+                    imageVector = Icons.Default.List,
+                    contentDescription = "Waveforms",
+                    tint = TextSecondary,
+                )
+            }
+            IconButton(
+                onClick = onSettingsClick,
+                modifier = Modifier.testTag("settings_button"),
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Settings,
+                    contentDescription = "Settings",
+                    tint = TextSecondary,
+                )
+            }
         }
     }
 }

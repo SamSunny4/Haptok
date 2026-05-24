@@ -2,6 +2,7 @@
 Haptok FastAPI Application
 
 REST + WebSocket API for uploading videos and receiving haptic timelines.
+Includes a simple web dashboard at /dashboard.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 import config
 from schemas import (
@@ -166,6 +167,42 @@ async def health_check() -> dict:
     }
 
 
+@app.get("/api/v1/system/stats", tags=["system"])
+async def system_stats() -> dict:
+    """System stats: GPU usage, active jobs, queue depth."""
+    gpu = config.get_gpu_stats()
+
+    # Count active jobs from Redis
+    active_jobs = []
+    r = await get_redis()
+    keys = []
+    async for key in r.scan_iter("job:*:status"):
+        keys.append(key)
+    for key in keys[-20:]:  # Last 20 jobs
+        raw = await r.get(key)
+        if raw:
+            try:
+                job = json.loads(raw)
+                active_jobs.append({
+                    "job_id": job.get("job_id", ""),
+                    "status": job.get("status", ""),
+                    "progress": job.get("progress", 0),
+                    "message": job.get("message", ""),
+                    "stage_detail": job.get("stage_detail", ""),
+                    "eta_seconds": job.get("eta_seconds"),
+                })
+            except Exception:
+                pass
+
+    return {
+        "gpu": gpu,
+        "device": config.DEVICE,
+        "max_file_size_mb": config.MAX_FILE_SIZE // (1024 * 1024),
+        "max_duration_s": config.MAX_VIDEO_DURATION,
+        "jobs": sorted(active_jobs, key=lambda j: j.get("status", ""), reverse=True),
+    }
+
+
 @app.post(
     "/api/v1/videos/upload",
     response_model=UploadResponse,
@@ -277,6 +314,20 @@ async def get_haptic_timeline(job_id: str) -> JSONResponse:
     return JSONResponse(content=json.loads(raw_result))
 
 
+@app.get("/api/v1/jobs/{job_id}/haptics/download", tags=["jobs"])
+async def download_haptic_timeline(job_id: str) -> JSONResponse:
+    """Download haptic timeline as a file."""
+    r = await get_redis()
+    raw_result = await r.get(f"job:{job_id}:result")
+    if not raw_result:
+        raise HTTPException(status_code=404, detail="Haptic result not found")
+
+    return JSONResponse(
+        content=json.loads(raw_result),
+        headers={"Content-Disposition": f'attachment; filename="haptic_{job_id[:8]}.json"'},
+    )
+
+
 @app.websocket("/ws/jobs/{job_id}")
 async def websocket_job_updates(websocket: WebSocket, job_id: str) -> None:
     """
@@ -315,6 +366,157 @@ async def websocket_job_updates(websocket: WebSocket, job_id: str) -> None:
     finally:
         await pubsub.unsubscribe(f"job:{job_id}")
         await pubsub.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Haptok Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0a1a; color: #e0e0e0; padding: 20px; }
+  h1 { color: #7c4dff; margin-bottom: 20px; font-size: 28px; }
+  h2 { color: #00bcd4; margin: 20px 0 10px; font-size: 18px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; margin-bottom: 20px; }
+  .card {
+    background: linear-gradient(135deg, rgba(124,77,255,0.1), rgba(0,188,212,0.05));
+    border: 1px solid rgba(124,77,255,0.3); border-radius: 12px; padding: 16px;
+  }
+  .card-title { font-size: 12px; text-transform: uppercase; color: #888; margin-bottom: 8px; letter-spacing: 1px; }
+  .card-value { font-size: 32px; font-weight: 700; color: #fff; }
+  .card-sub { font-size: 13px; color: #aaa; margin-top: 4px; }
+  .gauge { width: 100%; height: 8px; background: #1a1a2e; border-radius: 4px; overflow: hidden; margin-top: 8px; }
+  .gauge-fill { height: 100%; border-radius: 4px; transition: width 0.5s ease; }
+  .gauge-gpu { background: linear-gradient(90deg, #7c4dff, #00bcd4); }
+  .gauge-mem { background: linear-gradient(90deg, #ff6b6b, #ffa726); }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  th { text-align: left; padding: 10px 12px; background: rgba(124,77,255,0.15); color: #7c4dff; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+  td { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 13px; }
+  tr:hover td { background: rgba(124,77,255,0.05); }
+  .status-badge { padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+  .status-complete { background: #1b5e20; color: #66bb6a; }
+  .status-processing { background: #1a237e; color: #7c4dff; }
+  .status-queued { background: #33333a; color: #aaa; }
+  .status-failed { background: #b71c1c; color: #ef5350; }
+  .progress-bar { width: 100px; height: 6px; background: #1a1a2e; border-radius: 3px; display: inline-block; vertical-align: middle; }
+  .progress-fill { height: 100%; background: #00bcd4; border-radius: 3px; transition: width 0.3s; }
+  .refresh-note { font-size: 11px; color: #555; margin-top: 12px; }
+  .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #66bb6a; display: inline-block; animation: pulse 2s infinite; margin-right: 6px; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>⚡ Haptok Dashboard</h1>
+  <span><span class="live-dot"></span>Live — auto-refreshes every 2s</span>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <div class="card-title">GPU Usage</div>
+    <div class="card-value" id="gpu-usage">—</div>
+    <div class="gauge"><div class="gauge-fill gauge-gpu" id="gpu-gauge" style="width:0%"></div></div>
+    <div class="card-sub" id="gpu-temp"></div>
+  </div>
+  <div class="card">
+    <div class="card-title">VRAM</div>
+    <div class="card-value" id="vram-usage">—</div>
+    <div class="gauge"><div class="gauge-fill gauge-mem" id="vram-gauge" style="width:0%"></div></div>
+    <div class="card-sub" id="vram-detail"></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Device</div>
+    <div class="card-value" id="device-type" style="font-size:22px;">—</div>
+    <div class="card-sub">Max upload: <span id="max-size">—</span> MB | Max duration: <span id="max-dur">—</span>s</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Active Jobs</div>
+    <div class="card-value" id="job-count">0</div>
+    <div class="card-sub" id="job-summary"></div>
+  </div>
+</div>
+
+<h2>Recent Jobs</h2>
+<table>
+  <thead><tr><th>Job ID</th><th>Status</th><th>Progress</th><th>Message</th><th>ETA</th></tr></thead>
+  <tbody id="jobs-table"><tr><td colspan="5">Loading...</td></tr></tbody>
+</table>
+
+<div class="refresh-note">Dashboard polls /api/v1/system/stats every 2 seconds</div>
+
+<script>
+async function refresh() {
+  try {
+    const resp = await fetch('/api/v1/system/stats');
+    const data = await resp.json();
+
+    // GPU
+    const gpuPct = data.gpu?.usage_pct;
+    document.getElementById('gpu-usage').textContent = gpuPct != null ? gpuPct.toFixed(0) + '%' : 'N/A';
+    document.getElementById('gpu-gauge').style.width = (gpuPct || 0) + '%';
+    const temp = data.gpu?.temperature_c;
+    document.getElementById('gpu-temp').textContent = temp != null ? temp + '°C' : '';
+
+    // VRAM
+    const vramUsed = data.gpu?.memory_used_mb;
+    const vramTotal = data.gpu?.memory_total_mb;
+    if (vramUsed != null && vramTotal != null) {
+      document.getElementById('vram-usage').textContent = (vramUsed/1024).toFixed(1) + ' GB';
+      document.getElementById('vram-gauge').style.width = ((vramUsed/vramTotal)*100).toFixed(0) + '%';
+      document.getElementById('vram-detail').textContent = vramUsed + ' / ' + vramTotal + ' MB';
+    } else {
+      document.getElementById('vram-usage').textContent = 'N/A';
+    }
+
+    // Device
+    document.getElementById('device-type').textContent = data.device || 'cpu';
+    document.getElementById('max-size').textContent = data.max_file_size_mb || '—';
+    document.getElementById('max-dur').textContent = data.max_duration_s || '—';
+
+    // Jobs
+    const jobs = data.jobs || [];
+    const active = jobs.filter(j => j.status === 'processing' || j.status === 'queued');
+    document.getElementById('job-count').textContent = active.length;
+    document.getElementById('job-summary').textContent = jobs.length + ' total tracked';
+
+    const tbody = document.getElementById('jobs-table');
+    if (jobs.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="color:#555">No jobs yet</td></tr>';
+    } else {
+      tbody.innerHTML = jobs.map(j => {
+        const statusClass = 'status-' + (j.status || 'queued');
+        const pct = ((j.progress || 0) * 100).toFixed(0);
+        const eta = j.eta_seconds != null ? j.eta_seconds.toFixed(0) + 's' : '—';
+        return '<tr>' +
+          '<td style="font-family:monospace;font-size:12px">' + (j.job_id || '').substring(0, 8) + '</td>' +
+          '<td><span class="status-badge ' + statusClass + '">' + (j.status || '') + '</span></td>' +
+          '<td><div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%"></div></div> ' + pct + '%</td>' +
+          '<td>' + (j.message || j.stage_detail || '') + '</td>' +
+          '<td>' + eta + '</td></tr>';
+      }).join('');
+    }
+  } catch(e) {
+    console.error('Dashboard refresh failed:', e);
+  }
+}
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>"""
+
+
+@app.get("/dashboard", response_class=HTMLResponse, tags=["system"])
+async def dashboard():
+    """Simple web dashboard for monitoring Haptok backend."""
+    return HTMLResponse(content=DASHBOARD_HTML)
 
 
 # ---------------------------------------------------------------------------

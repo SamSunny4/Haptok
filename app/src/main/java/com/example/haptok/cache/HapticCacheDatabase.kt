@@ -45,8 +45,14 @@ interface HapticCacheDao {
     @Query("SELECT * FROM cached_haptic_tracks ORDER BY created_at DESC")
     suspend fun getAll(): List<CachedHapticTrack>
 
+    @Query("SELECT * FROM cached_haptic_tracks WHERE id = :id LIMIT 1")
+    suspend fun getById(id: Long): CachedHapticTrack?
+
     @Delete
     suspend fun delete(track: CachedHapticTrack)
+
+    @Query("DELETE FROM cached_haptic_tracks WHERE id = :id")
+    suspend fun deleteById(id: Long)
 
     @Query("DELETE FROM cached_haptic_tracks WHERE id IN (SELECT id FROM cached_haptic_tracks ORDER BY created_at ASC LIMIT :count)")
     suspend fun deleteOldest(count: Int)

@@ -11,8 +11,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import com.example.haptok.cache.HapticCacheManager
 
 enum class ProcessingStatus {
     NONE,
@@ -42,6 +44,11 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _uiState = MutableStateFlow(HomeUiState())
     val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
+    private val cacheManager = HapticCacheManager(application.applicationContext)
+
+    suspend fun hasCachedWaveform(uri: String): Boolean {
+        return cacheManager.hasCacheForUri(uri)
+    }
 
     fun onPermissionGranted() {
         _uiState.update { it.copy(hasPermission = true) }

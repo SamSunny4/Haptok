@@ -17,9 +17,10 @@ import kotlinx.coroutines.flow.asStateFlow
  * UI state for the settings screen.
  */
 data class SettingsUiState(
-    val serverUrl: String = "http://10.0.2.2:8000",
+    val serverUrl: String = "http://192.168.1.8:8000",
     val hapticIntensity: Float = 0.75f,
     val fallbackEnabled: Boolean = true,
+    val forceNativeHaptics: Boolean = false,
     val latencyOffsetMs: Int = -30,
     val deviceProfile: DeviceProfile? = null,
     val cacheCount: Int = 0,
@@ -36,7 +37,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         private const val KEY_SERVER_URL = "server_url"
         private const val KEY_HAPTIC_INTENSITY = "haptic_intensity"
         private const val KEY_FALLBACK_ENABLED = "fallback_enabled"
+        private const val KEY_FORCE_NATIVE = "force_native_haptics"
         private const val KEY_LATENCY_OFFSET = "latency_offset_ms"
+        private const val DEFAULT_SERVER_URL = "http://192.168.1.8:8000"
     }
 
     private val context = application.applicationContext
@@ -54,13 +57,13 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private fun loadSettings() {
         val profile = HapticCapabilityManager.getProfile(context)
         _uiState.value = SettingsUiState(
-            serverUrl = prefs.getString(KEY_SERVER_URL, "http://10.0.2.2:8000") ?: "http://10.0.2.2:8000",
+            serverUrl = prefs.getString(KEY_SERVER_URL, DEFAULT_SERVER_URL) ?: DEFAULT_SERVER_URL,
             hapticIntensity = prefs.getFloat(KEY_HAPTIC_INTENSITY, 0.75f),
             fallbackEnabled = prefs.getBoolean(KEY_FALLBACK_ENABLED, true),
+            forceNativeHaptics = prefs.getBoolean(KEY_FORCE_NATIVE, false),
             latencyOffsetMs = prefs.getInt(KEY_LATENCY_OFFSET, -30),
             deviceProfile = profile,
         )
-
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(cacheCount = cacheManager.getCacheCount())
         }
@@ -80,6 +83,11 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun toggleFallback(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_FALLBACK_ENABLED, enabled).apply()
         _uiState.value = _uiState.value.copy(fallbackEnabled = enabled)
+    }
+
+    fun toggleForceNative(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_FORCE_NATIVE, enabled).apply()
+        _uiState.value = _uiState.value.copy(forceNativeHaptics = enabled)
     }
 
     fun updateLatencyOffset(offsetMs: Int) {

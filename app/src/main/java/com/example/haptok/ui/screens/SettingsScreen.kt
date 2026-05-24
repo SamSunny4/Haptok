@@ -183,6 +183,33 @@ fun SettingsScreen(
                 }
             }
 
+            // ── Force Native Haptics ──
+            SettingsSection(title = "Force Native Haptics", icon = Icons.Filled.Vibration) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Skip Backend Processing", color = TextPrimary, style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "Always use real-time audio haptics — no upload required. Lower quality but instant.",
+                            color = TextTertiary,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Switch(
+                        checked = uiState.forceNativeHaptics,
+                        onCheckedChange = viewModel::toggleForceNative,
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color(0xFF4CAF50),
+                            checkedTrackColor = Color(0xFF4CAF50).copy(alpha = 0.4f),
+                        ),
+                        modifier = Modifier.testTag("force_native_toggle"),
+                    )
+                }
+            }
+
             // ── Latency Compensation ──
             SettingsSection(title = "Latency Calibration", icon = Icons.Filled.Speed) {
                 Text(

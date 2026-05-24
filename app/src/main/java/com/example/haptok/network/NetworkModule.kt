@@ -24,7 +24,7 @@ class NetworkModule private constructor(private val context: Context) {
         private const val TAG = "NetworkModule"
         private const val PREFS_NAME = "haptok_settings"
         const val PREF_KEY_BASE_URL = "server_url"
-        const val DEFAULT_BASE_URL = "http://10.0.2.2:8000"
+        const val DEFAULT_BASE_URL = "http://192.168.1.8:8000"
 
         @Volatile
         private var INSTANCE: NetworkModule? = null

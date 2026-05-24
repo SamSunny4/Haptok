@@ -1,8 +1,9 @@
 # ============================================================================
-# Haptok Backend — Docker Compose
+# Haptok Backend — Docker Compose (ROCm GPU Enabled)
 # ============================================================================
 # Quick start:   docker compose up --build
-# With GPU:      Uncomment the device lines below + update Dockerfile base
+# Dashboard:     http://192.168.1.8:8000/dashboard
+# Health check:  http://192.168.1.8:8000/health
 # ============================================================================
 
 services:
@@ -16,54 +17,67 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/1
-      - UPLOAD_DIR=/data/uploads
-      - MODELS_DIR=/data/models
-      - MAX_VIDEO_DURATION=240
-      - MAX_FILE_SIZE=524288000
+      - HAPTOK_REDIS_URL=redis://redis:6379/0
+      - HAPTOK_CELERY_BROKER_URL=redis://redis:6379/0
+      - HAPTOK_CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - HAPTOK_UPLOAD_DIR=/data/uploads
+      - HAPTOK_MODELS_DIR=/data/models
+      - HAPTOK_MAX_VIDEO_DURATION=240
+      - HAPTOK_MAX_FILE_SIZE=268435456
+      - HAPTOK_GPU_STATS_ENABLED=true
+      - PYTORCH_ROCM_ARCH=gfx1032
+      - HSA_OVERRIDE_GFX_VERSION=10.3.0
     volumes:
       - haptok-data:/data
     depends_on:
       redis:
         condition: service_healthy
     restart: unless-stopped
-    # ── AMD ROCm GPU support (uncomment for GPU acceleration) ──
-    # devices:
-    #   - /dev/kfd:/dev/kfd
-    #   - /dev/dri:/dev/dri
-    # group_add:
-    #   - video
-    #   - render
+    # ── AMD ROCm GPU support for RX 6600 ──
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
 
   # --------------------------------------------------------------------------
-  # Celery worker (processes videos)
+  # Celery worker (processes videos on GPU)
   # --------------------------------------------------------------------------
   worker:
     build: .
     container_name: haptok-worker
     command: celery -A worker.celery_app worker --loglevel=info --concurrency=2
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/1
-      - UPLOAD_DIR=/data/uploads
-      - MODELS_DIR=/data/models
-      - MAX_VIDEO_DURATION=240
+      - HAPTOK_REDIS_URL=redis://redis:6379/0
+      - HAPTOK_CELERY_BROKER_URL=redis://redis:6379/0
+      - HAPTOK_CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - HAPTOK_UPLOAD_DIR=/data/uploads
+      - HAPTOK_MODELS_DIR=/data/models
+      - HAPTOK_MAX_VIDEO_DURATION=240
+      - HAPTOK_MAX_FILE_SIZE=268435456
+      - HAPTOK_GPU_STATS_ENABLED=true
+      - PYTORCH_ROCM_ARCH=gfx1032
+      - HSA_OVERRIDE_GFX_VERSION=10.3.0
     volumes:
       - haptok-data:/data
     depends_on:
       redis:
         condition: service_healthy
     restart: unless-stopped
-    # ── AMD ROCm GPU support (uncomment for GPU acceleration) ──
-    # devices:
-    #   - /dev/kfd:/dev/kfd
-    #   - /dev/dri:/dev/dri
-    # group_add:
-    #   - video
-    #   - render
+    # ── AMD ROCm GPU support for RX 6600 ──
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A worker.celery_app inspect ping --timeout 5 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   # --------------------------------------------------------------------------
   # Redis — job queue + status storage

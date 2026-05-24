@@ -124,10 +124,10 @@ class WebSocketManager(
                     val status = jobStatusAdapter.fromJson(text)
                     if (status != null) {
                         _statusUpdates.tryEmit(status)
-                        Log.d(TAG, "Status: ${status.status} / ${status.stage}")
+                        Log.d(TAG, "Status: ${status.status} / ${status.message}")
 
                         // Stop reconnecting once the job reaches a terminal state.
-                        if (status.status == "completed" || status.status == "failed") {
+                        if (status.status == "complete" || status.status == "completed" || status.status == "failed") {
                             shouldReconnect = false
                         }
                     }

@@ -19,6 +19,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * Core haptic playback engine.
@@ -135,13 +136,21 @@ class HapticEngine(context: Context) {
     /**
      * Fire a single [HapticEvent] immediately (used by [HapticTimelinePlayer]
      * and fallback engine).
+     * Vibration is dispatched on Main thread for maximum OEM compatibility.
      */
     fun fireEvent(event: HapticEvent) {
-        try {
-            val combined = translator.translateCombined(event)
-            vibratorManager.vibrate(combined)
+        val combined = try {
+            translator.translateCombined(event)
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to fire event: ${e.message}")
+            Log.w(TAG, "Failed to translate event: ${e.message}")
+            return
+        }
+        scope.launch(Dispatchers.Main) {
+            try {
+                vibratorManager.vibrate(combined)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to vibrate: ${e.message}")
+            }
         }
     }
 
@@ -193,7 +202,7 @@ class HapticEngine(context: Context) {
 
                 try {
                     val combined = translator.translateCombined(event)
-                    vibratorManager.vibrate(combined)
+                    withContext(Dispatchers.Main) { vibratorManager.vibrate(combined) }
                 } catch (e: Exception) {
                     Log.w(TAG, "Vibration error at ${event.timeSeconds}s: ${e.message}")
                 }

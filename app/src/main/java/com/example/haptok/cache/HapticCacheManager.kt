@@ -8,8 +8,11 @@ import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStream
 import java.security.MessageDigest
+import android.os.Environment
 
 /**
  * High-level cache manager for haptic timelines.
@@ -78,6 +81,48 @@ class HapticCacheManager(private val context: Context) {
     /** Return total number of cached entries. */
     suspend fun getCacheCount(): Int = withContext(Dispatchers.IO) {
         dao.getTotalCount()
+    }
+
+    suspend fun getAllCached(): List<CachedHapticTrack> = withContext(Dispatchers.IO) {
+        dao.getAll()
+    }
+
+    suspend fun getCacheById(id: Long): CachedHapticTrack? = withContext(Dispatchers.IO) {
+        dao.getById(id)
+    }
+
+    suspend fun deleteCached(id: Long) = withContext(Dispatchers.IO) {
+        dao.deleteById(id)
+    }
+
+    suspend fun hasCacheForUri(uri: String): Boolean = withContext(Dispatchers.IO) {
+        getCachedTimeline(uri) != null
+    }
+
+    suspend fun exportToFile(cacheId: Long): File? = withContext(Dispatchers.IO) {
+        try {
+            val allCached = dao.getAll()
+            val track = allCached.find { it.id == cacheId } ?: return@withContext null
+            
+            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            val haptokDir = File(downloadsDir, "Haptok")
+            if (!haptokDir.exists()) {
+                haptokDir.mkdirs()
+            }
+            
+            // Clean title for filename
+            val safeTitle = track.videoTitle.replace(Regex("[^a-zA-Z0-9.-]"), "_")
+            val outFile = File(haptokDir, "$safeTitle.haptic.json")
+            
+            FileOutputStream(outFile).use { out ->
+                out.write(track.hapticTimelineJson.toByteArray())
+            }
+            Log.d(TAG, "Exported timeline to ${outFile.absolutePath}")
+            outFile
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to export timeline: ${e.message}")
+            null
+        }
     }
 
     /** Clear all cached haptic tracks. */

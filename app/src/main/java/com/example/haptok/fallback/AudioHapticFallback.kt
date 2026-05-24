@@ -1,259 +1,236 @@
 package com.example.haptok.fallback
 
+import android.content.Context
 import android.media.audiofx.Visualizer
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.util.Log
-import com.example.haptok.haptics.HapticEngine
-import com.example.haptok.models.HapticEvent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlin.math.abs
-import kotlin.math.sqrt
 
 /**
- * Real-time audio-to-haptics fallback when the cloud backend is unavailable.
+ * Real-time audio → haptics engine.
  *
- * Attaches an Android [Visualizer] to the audio session produced by
- * ExoPlayer, captures FFT frames, extracts per-band energies, detects
- * transients via spectral flux, and maps the result to haptic events
- * that are sent to the [HapticEngine].
+ * Designed to produce *cinematic* haptic feedback for movie trailers and
+ * action content.  The key insight is that raw FFT energy alone produces
+ * random buzzing — instead we track **energy envelopes** over time and
+ * only fire haptics at **meaningful moments**:
  *
- * **Requires `RECORD_AUDIO` permission** — the caller must obtain it
- * before calling [start].
+ *  1. **Bass hits** — sudden spikes in sub-bass / bass energy (explosions,
+ *     impacts, bass drops).  Mapped to short, strong vibrations.
+ *  2. **Sustained rumble** — prolonged low-frequency energy (engines,
+ *     drones, tension music).  Mapped to gentle continuous vibration.
+ *  3. **Transients** — spectral flux (sudden broad-spectrum change like
+ *     gunshots, scene cuts, cymbal crashes).  Mapped to sharp taps.
  *
- * @param hapticEngine  Engine to fire detected haptic events through.
- * @param lookAheadMs   How early to fire events to compensate for motor latency.
+ * All haptic firing has cooldown timers to prevent motor spam and let
+ * each event be felt distinctly.
  */
-class AudioHapticFallback(
-    private val hapticEngine: HapticEngine,
-    private val lookAheadMs: Long = 20L,
-) {
+class AudioHapticFallback(private val context: Context) {
 
     companion object {
-        private const val TAG = "AudioHapticFallback"
+        private const val TAG = "AudioFallback"
 
-        // Frequency band boundaries (bin indices depend on capture size & sample rate).
-        // Using standard 44.1 kHz assumptions.
-        private const val SAMPLE_RATE = 44100
+        // ── Cooldowns (ms) — how long to wait before the same type fires again
+        private const val BASS_HIT_COOLDOWN_MS   = 100L
+        private const val RUMBLE_COOLDOWN_MS      = 200L
+        private const val TRANSIENT_COOLDOWN_MS   = 80L
     }
 
-    // ── State ───────────────────────────────────────────────────────────
+    var isRunning = false
+        private set
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var visualizer: Visualizer? = null
-    private var isRunning = false
 
-    private val subBassThreshold = AdaptiveThreshold(multiplier = 2.0f)
-    private val bassThreshold = AdaptiveThreshold(multiplier = 2.2f)
-    private val midThreshold = AdaptiveThreshold(multiplier = 2.5f)
-    private val highThreshold = AdaptiveThreshold(multiplier = 3.0f)
-    private val fluxThreshold = AdaptiveThreshold(multiplier = 2.0f, attackRate = 0.4f)
+    @Suppress("DEPRECATION")
+    private val vibrator: Vibrator =
+        context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
 
-    /** Previous FFT magnitudes for spectral flux computation. */
-    private var previousMagnitudes: FloatArray? = null
+    // ── Tuning knobs ────────────────────────────────────────────────────
+    @Volatile private var intensityMultiplier = 0.75f
+    fun setIntensity(v: Float) { intensityMultiplier = v.coerceIn(0f, 1f) }
 
-    // ── Public API ──────────────────────────────────────────────────────
+    // ── Envelope state (exponential moving averages) ─────────────────────
+    private var subEma     = 0f   // sub-bass 20–80 Hz
+    private var bassEma    = 0f   // bass 80–300 Hz
+    private var totalEma   = 0f   // total energy (all bins)
+    private var prevMag: FloatArray? = null
 
-    /**
-     * Attach to the given audio session and start analysing.
-     *
-     * @param audioSessionId  ExoPlayer's audio session ID
-     *   (`exoPlayer.audioSessionId`).
-     */
+    // ── Cooldown timestamps ──────────────────────────────────────────────
+    private var lastBassHitMs    = 0L
+    private var lastRumbleMs     = 0L
+    private var lastTransientMs  = 0L
+
+    // ── Public API ───────────────────────────────────────────────────────
+
     fun start(audioSessionId: Int) {
-        if (isRunning) {
-            Log.w(TAG, "Already running")
+        if (isRunning) return
+        if (audioSessionId == 0) {
+            Log.w(TAG, "audioSessionId=0, cannot start")
             return
         }
-
         try {
-            val viz = Visualizer(audioSessionId).apply {
-                captureSize = Visualizer.getCaptureSizeRange()[1] // max capture
+            val sizes = Visualizer.getCaptureSizeRange()
+            val captureSize = 1024.coerceIn(sizes[0], sizes[1])
+
+            visualizer = Visualizer(audioSessionId).apply {
+                this.captureSize = captureSize
                 setDataCaptureListener(
                     object : Visualizer.OnDataCaptureListener {
-                        override fun onWaveFormDataCapture(
-                            visualizer: Visualizer?,
-                            waveform: ByteArray?,
-                            samplingRate: Int,
-                        ) {
-                            // We only use FFT.
-                        }
-
-                        override fun onFftDataCapture(
-                            visualizer: Visualizer?,
-                            fft: ByteArray?,
-                            samplingRate: Int,
-                        ) {
-                            if (fft != null) {
-                                scope.launch { processFft(fft, samplingRate) }
+                        override fun onWaveFormDataCapture(v: Visualizer?, w: ByteArray?, r: Int) = Unit
+                        override fun onFftDataCapture(v: Visualizer?, fft: ByteArray?, r: Int) {
+                            if (fft != null && isRunning) {
+                                scope.launch { processFft(fft) }
                             }
                         }
                     },
-                    Visualizer.getMaxCaptureRate(),
-                    false, // waveform
-                    true,  // fft
+                    // ~10 Hz — fast enough for music, slow enough to not spam
+                    Visualizer.getMaxCaptureRate() / 2,
+                    false, true,
                 )
                 enabled = true
             }
-            visualizer = viz
             isRunning = true
-            Log.i(TAG, "Started (captureSize=${viz.captureSize})")
+            Log.i(TAG, "Started audioSession=$audioSessionId captureSize=$captureSize")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start Visualizer", e)
+            Log.e(TAG, "Visualizer start failed: ${e.message}", e)
         }
     }
 
-    /** Stop analysis and release the [Visualizer]. */
     fun stop() {
         isRunning = false
-        try {
-            visualizer?.enabled = false
-            visualizer?.release()
-        } catch (e: Exception) {
-            Log.w(TAG, "Error releasing Visualizer", e)
-        }
+        try { visualizer?.enabled = false; visualizer?.release() } catch (_: Exception) {}
         visualizer = null
-        previousMagnitudes = null
-        subBassThreshold.reset()
-        bassThreshold.reset()
-        midThreshold.reset()
-        highThreshold.reset()
-        fluxThreshold.reset()
+        resetState()
         Log.d(TAG, "Stopped")
     }
 
-    /** Release all resources including the coroutine scope. */
-    fun release() {
-        stop()
-        scope.cancel()
-    }
+    fun release() { stop(); scope.cancel() }
 
-    // ── FFT Processing ──────────────────────────────────────────────────
+    // ── FFT processing ───────────────────────────────────────────────────
 
-    /**
-     * Process a single FFT frame captured by the [Visualizer].
-     *
-     * The byte array layout from Android Visualizer FFT:
-     * `[Re(0), Im(0), Re(1), Im(1), … Re(n/2), Im(n/2)]`
-     * where the first pair is DC (Im is always 0) and the last pair is Nyquist.
-     */
-    private fun processFft(fft: ByteArray, samplingRate: Int) {
-        val n = fft.size / 2 // number of frequency bins
-        if (n < 4) return
+    private fun processFft(fft: ByteArray) {
+        val n = fft.size / 2
+        if (n < 8) return
+        val now = System.currentTimeMillis()
 
-        val actualSampleRate = samplingRate / 1000 // Visualizer returns in mHz
-        val binWidth = actualSampleRate.toFloat() / (2 * n)
-
-        // Compute magnitudes.
-        val magnitudes = FloatArray(n)
-        for (i in 0 until n) {
+        // Magnitudes (skip DC)
+        val mag = FloatArray(n)
+        for (i in 1 until n) {
             val re = fft[2 * i].toFloat()
             val im = fft[2 * i + 1].toFloat()
-            magnitudes[i] = sqrt(re * re + im * im)
+            mag[i] = kotlin.math.sqrt(re * re + im * im)
         }
 
-        // ── Band energies ───────────────────────────────────────────
-        val subBassEnergy = bandEnergy(magnitudes, binWidth, 20f, 80f)
-        val bassEnergy = bandEnergy(magnitudes, binWidth, 80f, 250f)
-        val midEnergy = bandEnergy(magnitudes, binWidth, 250f, 2000f)
-        val highEnergy = bandEnergy(magnitudes, binWidth, 2000f, 20000f)
+        // Bin frequency width: Visualizer internally uses 44100 Hz
+        val binHz = 22050f / n
 
-        // ── Spectral flux (transient detection) ─────────────────────
-        val flux = computeSpectralFlux(magnitudes)
-        val isTransient = fluxThreshold.isAboveThreshold("flux", flux)
+        // ── Band energies ─────────────────────────────────────────────
+        val subEnergy  = bandSum(mag, binHz, 20f,  80f)
+        val bassEnergy = bandSum(mag, binHz, 80f,  300f)
+        val midEnergy  = bandSum(mag, binHz, 300f, 2000f)
+        val highEnergy = bandSum(mag, binHz, 2000f, 16000f)
+        val totalEnergy = subEnergy + bassEnergy + midEnergy + highEnergy
 
-        // ── Map to haptic events ────────────────────────────────────
-
-        // Transient detection → impact haptic.
-        if (isTransient && flux > 50f) {
-            val intensity = (flux / 500f).coerceIn(0.3f, 1.0f)
-            val sharpness = if (highEnergy > midEnergy) 0.8f else 0.4f
-            hapticEngine.fireEvent(
-                HapticEvent(
-                    type = "transient",
-                    timeSeconds = 0.0, // immediate
-                    durationSeconds = null,
-                    intensity = intensity,
-                    sharpness = sharpness,
-                    frequencyHz = null,
-                    tags = listOf("impact"),
-                    spatialHint = null,
-                    actuatorId = null,
-                )
-            )
-        }
-
-        // Sub-bass above threshold → continuous low rumble.
-        if (subBassThreshold.isAboveThreshold("sub_bass", subBassEnergy)) {
-            val intensity = (subBassEnergy / 300f).coerceIn(0.2f, 0.8f)
-            hapticEngine.fireEvent(
-                HapticEvent(
-                    type = "continuous",
-                    timeSeconds = 0.0,
-                    durationSeconds = 0.04, // 40 ms segment
-                    intensity = intensity,
-                    sharpness = 0.1f,
-                    frequencyHz = 50,
-                    tags = listOf("engine_rumble"),
-                    spatialHint = null,
-                    actuatorId = null,
-                )
-            )
-        }
-
-        // Mid energy → subtle texture.
-        if (midThreshold.isAboveThreshold("mid", midEnergy)) {
-            val intensity = (midEnergy / 400f).coerceIn(0.1f, 0.5f)
-            hapticEngine.fireEvent(
-                HapticEvent(
-                    type = "continuous",
-                    timeSeconds = 0.0,
-                    durationSeconds = 0.03,
-                    intensity = intensity,
-                    sharpness = 0.5f,
-                    frequencyHz = null,
-                    tags = listOf("tension"),
-                    spatialHint = null,
-                    actuatorId = null,
-                )
-            )
-        }
-
-        previousMagnitudes = magnitudes
-    }
-
-    // ── Helpers ──────────────────────────────────────────────────────────
-
-    /** Sum of magnitudes in the frequency range [loHz, hiHz). */
-    private fun bandEnergy(
-        magnitudes: FloatArray,
-        binWidth: Float,
-        loHz: Float,
-        hiHz: Float,
-    ): Float {
-        val loIdx = (loHz / binWidth).toInt().coerceIn(0, magnitudes.size - 1)
-        val hiIdx = (hiHz / binWidth).toInt().coerceIn(loIdx, magnitudes.size - 1)
-        var sum = 0f
-        for (i in loIdx..hiIdx) sum += magnitudes[i]
-        return sum
-    }
-
-    /**
-     * Half-wave-rectified spectral flux: the sum of positive magnitude
-     * differences between the current and previous frame.
-     */
-    private fun computeSpectralFlux(currentMag: FloatArray): Float {
-        val prev = previousMagnitudes ?: return 0f
-        val len = minOf(currentMag.size, prev.size)
+        // ── Spectral flux (onset detection) ───────────────────────────
+        val prev = prevMag
         var flux = 0f
-        for (i in 0 until len) {
-            val diff = currentMag[i] - prev[i]
-            if (diff > 0) flux += diff
+        if (prev != null && prev.size == mag.size) {
+            for (i in 1 until n) {
+                val d = mag[i] - prev[i]
+                if (d > 0f) flux += d
+            }
         }
-        return flux
+        prevMag = mag.copyOf()
+
+        // ── Update EMAs (alpha=0.25 = faster response to changes) ──────
+        val alpha = 0.25f
+        subEma   = alpha * subEnergy   + (1f - alpha) * subEma
+        bassEma  = alpha * bassEnergy  + (1f - alpha) * bassEma
+        totalEma = alpha * totalEnergy + (1f - alpha) * totalEma
+
+        val mult = intensityMultiplier
+        if (mult < 0.01f) return
+
+        // ═══════════════════════════════════════════════════════════════
+        //  DECISION LOGIC — priority: transient > bass hit > rumble
+        // ═══════════════════════════════════════════════════════════════
+
+        // 1) TRANSIENT — spectral flux spike = impact / beat / scene cut
+        val fluxThreshold = maxOf(120f, totalEma * 0.8f)
+        if (flux > fluxThreshold && (now - lastTransientMs) > TRANSIENT_COOLDOWN_MS) {
+            lastTransientMs = now
+            val ratio = (flux / fluxThreshold).coerceIn(1f, 4f)
+            val amp = (mult * 0.35f * ratio).coerceIn(0.2f, 1.0f)
+            fireOneShot(30, amp)
+            return
+        }
+
+        // 2) BASS HIT — sub+bass sudden spike above its average
+        val lowEnergy = subEnergy + bassEnergy
+        val lowEma = subEma + bassEma
+        val bassThreshold = maxOf(80f, lowEma * 1.8f)
+        if (lowEnergy > bassThreshold && (now - lastBassHitMs) > BASS_HIT_COOLDOWN_MS) {
+            lastBassHitMs = now
+            val ratio = (lowEnergy / bassThreshold).coerceIn(1f, 4f)
+            val amp = (mult * 0.45f * ratio).coerceIn(0.25f, 1.0f)
+            fireOneShot(55, amp)
+            return
+        }
+
+        // 3) SUSTAINED RUMBLE — prolonged sub-bass (engines, drones)
+        if (subEnergy > maxOf(50f, subEma * 1.3f) &&
+            (now - lastRumbleMs) > RUMBLE_COOLDOWN_MS
+        ) {
+            lastRumbleMs = now
+            val amp = (mult * (subEnergy / maxOf(1f, subEma)) * 0.15f).coerceIn(0.08f, 0.45f)
+            fireWaveform(90, amp)
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+
+    private fun bandSum(mag: FloatArray, binHz: Float, lo: Float, hi: Float): Float {
+        val iLo = maxOf(1, (lo / binHz).toInt())
+        val iHi = minOf(mag.size - 1, (hi / binHz).toInt())
+        var s = 0f
+        for (i in iLo..iHi) s += mag[i]
+        return s
+    }
+
+    private fun fireOneShot(ms: Long, amplitude: Float) {
+        val amp = (amplitude * 255).toInt().coerceIn(1, 255)
+        vibrator.vibrate(
+            if (vibrator.hasAmplitudeControl())
+                VibrationEffect.createOneShot(ms, amp)
+            else
+                VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE)
+        )
+    }
+
+    private fun fireWaveform(ms: Long, amplitude: Float) {
+        if (!vibrator.hasAmplitudeControl()) {
+            // Skip continuous rumble on devices without amplitude control, 
+            // otherwise it just buzzes constantly at max strength.
+            return
+        }
+        val amp = (amplitude * 255).toInt().coerceIn(1, 255)
+        vibrator.vibrate(
+            VibrationEffect.createWaveform(
+                longArrayOf(0, ms),
+                intArrayOf(0, amp),
+                -1
+            )
+        )
+    }
+
+    private fun resetState() {
+        subEma = 0f; bassEma = 0f; totalEma = 0f
+        prevMag = null
+        lastBassHitMs = 0L; lastRumbleMs = 0L; lastTransientMs = 0L
     }
 }
